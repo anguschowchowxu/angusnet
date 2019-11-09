@@ -30,7 +30,7 @@ class weighted_bce_dice_loss_2d(nn.Module):
             weight = weight.expand(-1, target.size(1)) # (batch_size, 3*y*x)
         else:
             weight = None
-        # bce_loss = F.binary_cross_entropy(output, target.cuda().type(torch.LongTensor), weight, self.size_average)
+        bce_loss = F.binary_cross_entropy(output, target, weight, self.size_average)
 
         loss = dice_loss#  + bce_loss
 
