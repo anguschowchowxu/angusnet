@@ -1,3 +1,4 @@
+import time
 import logging
 
 class AverageMeter(object):
@@ -80,6 +81,7 @@ class CumMeter(object):
         fmtstr = '{name}-{val' + self.fmt + '}({sum' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
 
+
 class ProgressMeter(object):
     def __init__(self, num_batches, meters, prefix="", length=10):
         self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
@@ -88,17 +90,23 @@ class ProgressMeter(object):
         self.num_batches = num_batches
         self.length = length
         self.interval = num_batches // length
+        self.atd = time.time()
 
     def display(self, batch, log_level=logging.DEBUG, reduce=False):
         # entries = [self.prefix + self.batch_fmtstr.format(batch)]
         # entries += [str(meter) for meter in self.meters]
         # print('\t'.join(entries))
+        collapse_time = time.time() - self.atd
+        eta = collapse_time / (batch+1) * (self.num_batches - batch -1)
+
         count = (batch + self.interval - 1) / self.num_batches * self.length
         count = int(count)
         entries = [self.prefix + '['+'#'*count + ' '*(self.length - count)+']']
+        entries += ['{:.0f}s'.format(collapse_time)]
         if reduce:
             entries += [repr(meter) for meter in self.meters]
         else:
+            entries += ['eta- {:.0f}s'.format(eta)]
             entries += [str(meter) for meter in self.meters]
         print('  '.join(entries), end='\r', flush=True)
         logging.log(log_level, '  '.join(entries))

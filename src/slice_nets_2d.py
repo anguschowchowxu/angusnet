@@ -120,7 +120,45 @@ def get_dense2d_unet_v1(**_):
     dense2d_unet = model(down_channels=[96, 144, 192, 240, 288], up_channels=[768, 384, 96, 96, 64])
     return dense2d_unet
 
+from torch.quantization import fuse_modules
+from torch.quantization import QuantStub, DeQuantStub
 
+class Dense2D_UNet_v1_quantized(Dense2D_UNet_v1):
+    def __init__(self, down_channels=[96, 144, 192, 240, 288], up_channels=[768, 384, 96, 96, 64]):
+        super().__init__(down_channels=down_channels, up_channels=up_channels)
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+        
+    def forward(self, x):
+        x = self.quant(x)
+        
+        pre_conv = self.pre_conv(x)
+        pre_out = self.pre_pool(pre_conv)
+        db1_out, trans1 = self.block1(pre_out)
+        db2_out, trans2 = self.block2(trans1)
+        db3_out, trans3 = self.block3(trans2)
+        db4_out, trans4 = self.block4(trans3)
+        up1_out = self.upsample1(db4_out, db3_out)
+        up2_out = self.upsample2(up1_out, db2_out)
+        up3_out = self.upsample3(up2_out, db1_out)
+        up4_out = self.upsample4(up3_out, pre_conv)
+        up5_out = self.upsample5(up4_out)
+        final_out1 = self.outlayer1(up5_out)
+        final_out2 = self.outlayer2(up5_out)
+
+        final_out1, final_out2 = self.dequant(final_out1), self.dequant(final_out2)
+        return final_out1, final_out2  
+
+    def fuse_model(self):
+        for m in self.modules():
+            if type(m) == Micro_Conv:
+                fuse_modules(m, ['micro_conv.2', 'micro_conv.3', 'micro_conv.4'], inplace=True)
+        return self
+
+def get_dense2d_unet_v1_quantized(**_):
+    model = globals().get('Dense2D_UNet_v1_quantized')
+    dense2d_unet = model(down_channels=[96, 144, 192, 240, 288], up_channels=[768, 384, 96, 96, 64])
+    return dense2d_unet
 
 
 class Dense2D_UNet_v2(nn.Module):

@@ -107,6 +107,9 @@ class MemoryDataset_v1(Dataset):
         self.image = np.load(data_dir)
         self.mask = np.load(mask_dir)
         self.input_shape = (3, self.image.shape[1], self.image.shape[2])
+        self._index_list = list(range(0,self.image.shape[0]-2))
+        self.index_list = list(range(0,self.image.shape[0]-2))
+
 
     def __len__(self):
         return self.image.shape[0]-2
@@ -121,13 +124,27 @@ class MemoryDataset_v1(Dataset):
         input_mask1[0:2,...] = (self.mask[index:index+2, ...]==1).astype('float32')
         input_mask2[0:2,...] = (self.mask[index:index+2, ...]==2).astype('float32')
 
-        input_img = input_img/255.
+        # input_img = input_img/255.
            
         return torch.from_numpy(input_img).float(), \
                 torch.from_numpy(input_mask1).float(), \
                 torch.from_numpy(input_mask2).float()
-        
 
+    def get_batch(self, indexs):
+        x = torch.zeros(len(indexs), *self.input_shape)
+        y1 = torch.zeros(len(indexs), *self.input_shape)
+        y2 = torch.zeros(len(indexs), *self.input_shape)
+
+        for i, index in enumerate(indexs):
+            _x, _y1, _y2 = self[self.index_list[index]]
+            x[i,...] =  _x
+            y1[i,...] =  _y1
+            y2[i,...] =  _y2
+
+        return x, y1, y2
+
+    def shuffle(self):
+        np.random.shuffle(self.index_list)
 
 
 def get_memory_data(split, data_dir, ids_list, transform=None):

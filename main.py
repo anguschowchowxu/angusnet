@@ -4,8 +4,10 @@ import random
 import shutil
 import time
 import warnings
-import logging 
+import logging
+import copy
 
+import numpy as np
 import pandas as pd
 
 import torch
@@ -22,8 +24,8 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 
 from log import configure, log_arguments
-from src.slice_nets_2d import get_dense2d_unet_v1
-from src.lung_seg_v1 import get_customized_dataloader
+from src.slice_nets_2d import get_dense2d_unet_v1, get_dense2d_unet_v1_quantized
+from src.lung_seg_v1 import get_customized_dataloader, MemoryDataset_v1
 from src.loss import weighted_bce_dice_loss_2d
 from src.lr_scheduler import CosineWithRestarts
 from metrics import binary_dice
@@ -87,8 +89,11 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 parser.add_argument('--log_level', default=20, type=int,
                     help='logging level')
+parser.add_argument('--quantize', dest='quantize', action='store_true',
+                    help='using quantization-aware traing')
 
-logger = configure(None, logging.INFO)
+log_path = 'logs/lung_segment.log'
+logger = configure(log_path, logging.INFO)
 best_dice = 0
 
 @log_arguments(logger)
@@ -132,8 +137,16 @@ def main():
         main_worker(args)
 
 def main_worker(args):
-
+    global best_dice
     model = get_dense2d_unet_v1()
+    model = get_dense2d_unet_v1_quantized()
+
+    # model = resume(model, args)
+
+    if args.quantize:
+        model.fuse_model()
+        model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+        torch.quantization.prepare_qat(model, inplace=True)
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
@@ -187,17 +200,23 @@ def main_worker(args):
     cudnn.benchmark = True
 
     train_dataloader = get_customized_dataloader(split='trn',
-                                    data_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/lung1.npy',
-                                    mask_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/mask1.npy',
-                                    batch_size=args.batch_size,
-                                    num_workers=args.workers)
-    valid_dataloader = get_customized_dataloader(split='val',
+    # train_dataloader = MemoryDataset_v1(
                                     data_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/lung_val.npy',
                                     mask_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/mask_val.npy',
                                     batch_size=args.batch_size,
-                                    num_workers=args.workers)
+                                    num_workers=args.workers,
+    )
+    valid_dataloader = get_customized_dataloader(split='val',
+    # valid_dataloader = MemoryDataset_v1(
+                                    data_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/lung_val.npy',
+                                    mask_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/mask_val.npy',
+                                    batch_size=args.batch_size,
+                                    num_workers=args.workers,
+    )
+
+
     criterion = weighted_bce_dice_loss_2d()
-    optimizer = optim.Adam(model.parameters(), lr=0.00005, weight_decay=0.00001)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=0.00001)
     scheduler = CosineWithRestarts(optimizer,
                      last_epoch=-1,
                      T_max=10,
@@ -208,10 +227,25 @@ def main_worker(args):
 
     model = model.cuda()
 
+    if args.evaluate:
+        validate(valid_dataloader, model, criterion, 0, args)
+        return
+
     for epoch in range(args.epochs):
         train(train_dataloader, model, criterion, optimizer, epoch, args)
 
-        dice = validate(valid_dataloader, model, criterion, epoch, args)
+        if epoch > 4 and args.quantize:
+            # Freeze quantizer parameters
+            model.apply(torch.quantization.disable_observer)
+        if epoch > 2 and args.quantize:
+            # Freeze batch norm mean and variance estimates
+            model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
+
+        if args.quantize:
+            qat_model = torch.quantization.convert(model.eval(), inplace=False)
+            dice = validate(valid_dataloader, qat_model, criterion, epoch, args)
+        else:       
+            dice = validate(valid_dataloader, model, criterion, epoch, args)
 
         scheduler.step()
 
@@ -220,20 +254,57 @@ def main_worker(args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
+            # if hasattr(model, 'module'):
+                # model_ = copy.deepcopy(model.module)
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
-                'state_dict': model.cpu().state_dict(),
+                'state_dict': model.module.state_dict(),
                 'best_metric': best_dice,
                 'optimizer' : optimizer.state_dict(),
             }, 
             is_best,
-            filename='checkpoints/checkpoint_{epoch}.pth.tar'.foramt(epoch))
+            filename='checkpoints/checkpoint_{epoch}.pth.tar'.format(epoch=epoch))
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.module.state_dict(),
+                'best_metric': best_dice,
+                'optimizer' : optimizer.state_dict(),
+            }, 
+            is_best,
+            filename='checkpoints/qat_checkpoint_{epoch}.pth.tar'.format(epoch=epoch))
 
+def resume(model, args):
+    global best_dice
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            if args.gpu is None:
+                checkpoint = torch.load(args.resume)
+            else:
+                # Map model to be loaded to specified single gpu.
+                loc = 'cuda:{}'.format(args.gpu)
+                checkpoint = torch.load(args.resume, map_location=loc)
+            model.load_state_dict(checkpoint)    
+            # args.start_epoch = checkpoint['epoch']
+            # best_dice = checkpoint['best_acc1']
+            # if args.gpu is not None:
+            #     # best_acc1 may be from a checkpoint from a different GPU
+            #     best_acc1 = best_acc1.to(args.gpu)
+            # model.load_state_dict(checkpoint['state_dict'])
+            # optimizer.load_state_dict(checkpoint['optimizer'])
+            # print("=> loaded checkpoint '{}' (epoch {})"
+            #       .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    return model
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
-    batch_time = CumMeter('Time(s)', ':6.2f')
-    data_time = CumMeter('Data(s)', ':6.2f')
+    batch_time = CumMeter('Time(s)', ':.2f')
+    data_time = CumMeter('Data(s)', ':.2f')
     losses = AverageMeter('bce', ':.3e')
     dices = AverageMeter('dice', ':.3f')
     progress = ProgressMeter(
@@ -243,11 +314,12 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         )
 
     model.train()
+    # train_loader.shuffle()
     end = time.time()
-    for batch, (x, y1, y2) in enumerate(train_loader):
-
-        if batch > 20:
-            break
+    for batch, (x, y1, y2) in enumerate(train_loader): 
+    # BUG: RuntimeError: cuDNN error: CUDNN_STATUS_BAD_PARAM           
+    # for batch in range(0, len(train_loader)//args.batch_size):   
+    #     x, y1, y2 = train_loader.get_batch(range(batch * args.batch_size, batch * (args.batch_size+1)))         
 
         data_time.update(time.time() - end)
 
@@ -265,12 +337,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         out_gt = y1 + y2  
         dice = binary_dice(out_pred, out_gt)
 
-        losses.update(loss, 2)
-        dices.update(dice, 2)
+        losses.update(loss.item(), 2)
+        dices.update(dice.item(), 2)
         batch_time.update(time.time() - end)
         end = time.time()
 
-        del x,y1,y2
+        del loss1, loss2, loss
+        del out1, out2, out_gt, out_pred
         if batch % args.print_freq == 0:
             progress.display(batch, logging.DEBUG)
 
@@ -278,10 +351,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
 
 def validate(val_loader, model, criterion, epoch, args):
-    batch_time = CumMeter('Time(s)', ':6.2f')
-    data_time = CumMeter('Data(s)', ':6.2f')
+    batch_time = CumMeter('Time(s)', ':.2f')
+    data_time = CumMeter('Data(s)', ':.2f')
     losses = AverageMeter('bce', ':.3e')
-    dices = MaxMeter('dice', ':.3f')
+    dices = AverageMeter('dice', ':.3f')
     progress = ProgressMeter(
         len(val_loader),
         [batch_time, data_time, losses, dices],
@@ -292,6 +365,9 @@ def validate(val_loader, model, criterion, epoch, args):
     end = time.time()
     with torch.no_grad():
         for batch, (x, y1, y2) in enumerate(val_loader):
+        # for batch in range(0, len(val_loader)//args.batch_size):   
+        #     x, y1, y2 = val_loader.get_batch(range(batch * args.batch_size, batch * (args.batch_size+1)))  
+
             data_time.update(time.time() - end)
 
             x, y1, y2 = x.cuda(), y1.cuda(), y2.cuda()
@@ -304,11 +380,13 @@ def validate(val_loader, model, criterion, epoch, args):
             out_gt = y1 + y2  
             dice = binary_dice(out_pred, out_gt)
 
-            losses.update(loss, 2)
-            dices.update(dice, 2)
+            losses.update(loss.item(), 2)
+            dices.update(dice.item(), 2)
             batch_time.update(time.time() - end)
             end = time.time()
 
+            del loss1, loss2, loss
+            del out1, out2, out_gt, out_pred
             if batch % args.print_freq == 0:
                 progress.display(batch, logging.DEBUG)
 
@@ -319,7 +397,9 @@ def validate(val_loader, model, criterion, epoch, args):
 def save_checkpoint(state, is_best, filename='checkpoints/checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, 'checkpoints/model_best.pth.tar')
 
 if __name__ == '__main__':
+    import pdb
     main()
+    # pdb.set_trace()
