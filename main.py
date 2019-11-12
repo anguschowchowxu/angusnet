@@ -9,6 +9,7 @@ import copy
 
 import numpy as np
 import pandas as pd
+import pdb
 
 import torch
 import torch.nn as nn
@@ -24,13 +25,13 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 
 from log import configure, log_arguments
-from src.slice_nets_2d import get_dense2d_unet_v1, get_dense2d_unet_v1_quantized
-from src.lung_seg_v1 import get_customized_dataloader, MemoryDataset_v1
-from src.loss import weighted_bce_dice_loss_2d
-from src.lr_scheduler import CosineWithRestarts
+from lib.slice_nets_2d import get_dense2d_unet_v1, get_dense2d_unet_v1_quantized
+from lib.lung_seg_v1 import get_customized_dataloader, MemoryDataset_v1
+from lib.loss import weighted_bce_dice_loss_2d
+from lib.lr_scheduler import CosineWithRestarts
 from metrics import binary_dice
 from utils.meters import AverageMeter, MaxMeter, ProgressMeter, CumMeter
-
+from src import utils
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -83,6 +84,7 @@ parser.add_argument('--seed', default=None, type=int,
 parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
 parser.add_argument('--multiprocessing-distributed', action='store_true',
+                    dest='multiprocessing_distributed',
                     help='Use multi-processing distributed training to launch '
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
@@ -101,6 +103,9 @@ def update_args(args):
     return args
 
 def main():
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '8022'
+
     args = parser.parse_args()
     args = update_args(args)
 
@@ -133,15 +138,17 @@ def main():
         mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function
-        # main_worker(args.gpu, ngpus_per_node, args)
-        main_worker(args)
+        main_worker(args.gpu, ngpus_per_node, args)
+        # main_worker(args)
 
-def main_worker(args):
+# def main_worker(args):
+def main_worker(gpu, ngpus_per_node, args):
     global best_dice
     model = get_dense2d_unet_v1()
-    model = get_dense2d_unet_v1_quantized()
+    # model = get_dense2d_unet_v1_quantized()
 
-    # model = resume(model, args)
+    # pdb.set_trace()
+    model = resume(model, args)
 
     if args.quantize:
         model.fuse_model()
@@ -150,6 +157,7 @@ def main_worker(args):
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
+
 
     if args.distributed:
         if args.dist_url == "env://" and args.rank == -1:
@@ -199,10 +207,16 @@ def main_worker(args):
    
     cudnn.benchmark = True
 
+    # TODO: add DistributedSampler
+    # if args.distributed:
+    #     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    # else:
+    #     train_sampler = None
+
     train_dataloader = get_customized_dataloader(split='trn',
     # train_dataloader = MemoryDataset_v1(
-                                    data_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/lung_val.npy',
-                                    mask_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/mask_val.npy',
+                                    data_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/lung_0.npy',
+                                    mask_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/mask_0.npy',
                                     batch_size=args.batch_size,
                                     num_workers=args.workers,
     )
@@ -287,7 +301,7 @@ def resume(model, args):
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.resume, map_location=loc)
-            model.load_state_dict(checkpoint)    
+            model.load_state_dict(checkpoint['model'])    
             # args.start_epoch = checkpoint['epoch']
             # best_dice = checkpoint['best_acc1']
             # if args.gpu is not None:
