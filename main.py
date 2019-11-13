@@ -20,17 +20,21 @@ import torch.optim as optim
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
+from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
-from log import configure, log_arguments
+from utils.log import configure, log_arguments
 from lib.slice_nets_2d import get_dense2d_unet_v1, get_dense2d_unet_v1_quantized
 from lib.lung_seg_v1 import get_customized_dataloader, MemoryDataset_v1
 from lib.loss import weighted_bce_dice_loss_2d
 from lib.lr_scheduler import CosineWithRestarts
-from metrics import binary_dice
+from lib.metrics import binary_dice
 from utils.meters import AverageMeter, MaxMeter, ProgressMeter, CumMeter
+from utils.tensorboard_utils import select_rand
+
+# if load model from kissnet
 from src import utils
 
 model_names = sorted(name for name in models.__dict__
@@ -144,11 +148,17 @@ def main():
 # def main_worker(args):
 def main_worker(gpu, ngpus_per_node, args):
     global best_dice
+
+    writer = SummaryWriter('runs/fashion_mnist_experiment_2')
     model = get_dense2d_unet_v1()
     # model = get_dense2d_unet_v1_quantized()
 
+    writer.add_graph(model, torch.randn(4,3,512,512))
+    writer.flush()
+
     # pdb.set_trace()
-    model = resume(model, args)
+    if args.resume:
+        model = resume(model, args)
 
     if args.quantize:
         model.fuse_model()
@@ -180,7 +190,9 @@ def main_worker(gpu, ngpus_per_node, args):
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
         # DistributedDataParallel will use all available devices.
-        if args.gpu is not None:
+        if args.gpu == -1:
+            model.cpu()
+        elif args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
             # When using a single GPU per process and per
@@ -194,6 +206,8 @@ def main_worker(gpu, ngpus_per_node, args):
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
+    elif args.gpu == -1:
+            model.cpu()
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
@@ -205,7 +219,8 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             model = torch.nn.DataParallel(model).cuda()
    
-    cudnn.benchmark = True
+    if args.gpu != -1:
+        cudnn.benchmark = True
 
     # TODO: add DistributedSampler
     # if args.distributed:
@@ -213,19 +228,19 @@ def main_worker(gpu, ngpus_per_node, args):
     # else:
     #     train_sampler = None
 
-    train_dataloader = get_customized_dataloader(split='trn',
-    # train_dataloader = MemoryDataset_v1(
+    # train_dataloader = get_customized_dataloader(split='trn',
+    train_dataloader = MemoryDataset_v1(
                                     data_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/lung_0.npy',
                                     mask_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/mask_0.npy',
-                                    batch_size=args.batch_size,
-                                    num_workers=args.workers,
+                                    # batch_size=args.batch_size,
+                                    # num_workers=args.workers,
     )
-    valid_dataloader = get_customized_dataloader(split='val',
-    # valid_dataloader = MemoryDataset_v1(
+    # valid_dataloader = get_customized_dataloader(split='val',
+    valid_dataloader = MemoryDataset_v1(
                                     data_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/lung_val.npy',
                                     mask_dir='/home/xyh/data/PreData/LUNA16/LUNA16_Original_Lung/mask_val.npy',
-                                    batch_size=args.batch_size,
-                                    num_workers=args.workers,
+                                    # batch_size=args.batch_size,
+                                    # num_workers=args.workers,
     )
 
 
@@ -239,14 +254,13 @@ def main_worker(gpu, ngpus_per_node, args):
                      decay=0.1,
                      start_decay_cycle=2)
 
-    model = model.cuda()
 
     if args.evaluate:
         validate(valid_dataloader, model, criterion, 0, args)
         return
 
     for epoch in range(args.epochs):
-        train(train_dataloader, model, criterion, optimizer, epoch, args)
+        train(train_dataloader, model, criterion, optimizer, epoch, args, writer)
 
         if epoch > 4 and args.quantize:
             # Freeze quantizer parameters
@@ -259,12 +273,15 @@ def main_worker(gpu, ngpus_per_node, args):
             qat_model = torch.quantization.convert(model.eval(), inplace=False)
             dice = validate(valid_dataloader, qat_model, criterion, epoch, args)
         else:       
-            dice = validate(valid_dataloader, model, criterion, epoch, args)
+            dice = validate(valid_dataloader, model, criterion, epoch, args, writer)
 
         scheduler.step()
 
         is_best = dice > best_dice
         best_dice = max(dice, best_dice)
+
+        writer.add_scalar('val_dice', dice)
+        writer.flush()
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -316,7 +333,9 @@ def resume(model, args):
 
     return model
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args, writer=None):
+    # TODO: get writer from locals()
+    # writer = locals()['writer']
     batch_time = CumMeter('Time(s)', ':.2f')
     data_time = CumMeter('Data(s)', ':.2f')
     losses = AverageMeter('bce', ':.3e')
@@ -328,12 +347,12 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         )
 
     model.train()
-    # train_loader.shuffle()
+    train_loader.shuffle()
     end = time.time()
-    for batch, (x, y1, y2) in enumerate(train_loader): 
+    # for batch, (x, y1, y2) in enumerate(train_loader): 
     # BUG: RuntimeError: cuDNN error: CUDNN_STATUS_BAD_PARAM           
-    # for batch in range(0, len(train_loader)//args.batch_size):   
-    #     x, y1, y2 = train_loader.get_batch(range(batch * args.batch_size, batch * (args.batch_size+1)))         
+    for batch in range(0, len(train_loader)//args.batch_size):   
+        x, y1, y2 = train_loader.get_batch(range(batch * args.batch_size, (batch+1) * args.batch_size))         
 
         data_time.update(time.time() - end)
 
@@ -356,15 +375,21 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        del loss1, loss2, loss
-        del out1, out2, out_gt, out_pred
         if batch % args.print_freq == 0:
             progress.display(batch, logging.DEBUG)
+            writer.add_scalar('train_loss',
+                loss.item(),
+                epoch * len(train_loader) + batch)
+            output_grid = select_rand(out_pred[:,1,...].detach(), out_gt[:,1,...].detach())
+            writer.add_image('out_pred', 
+                output_grid, 
+                epoch * len(train_loader) + batch,
+                dataformats='CHW')
 
     progress.display(batch, logging.INFO, reduce=True)
 
 
-def validate(val_loader, model, criterion, epoch, args):
+def validate(val_loader, model, criterion, epoch, args, writer=None):
     batch_time = CumMeter('Time(s)', ':.2f')
     data_time = CumMeter('Data(s)', ':.2f')
     losses = AverageMeter('bce', ':.3e')
@@ -378,9 +403,9 @@ def validate(val_loader, model, criterion, epoch, args):
     model.eval()
     end = time.time()
     with torch.no_grad():
-        for batch, (x, y1, y2) in enumerate(val_loader):
-        # for batch in range(0, len(val_loader)//args.batch_size):   
-        #     x, y1, y2 = val_loader.get_batch(range(batch * args.batch_size, batch * (args.batch_size+1)))  
+        # for batch, (x, y1, y2) in enumerate(val_loader):
+        for batch in range(0, len(val_loader)//args.batch_size):   
+            x, y1, y2 = val_loader.get_batch(range(batch * args.batch_size, (batch+1) * args.batch_size))         
 
             data_time.update(time.time() - end)
 
@@ -399,10 +424,11 @@ def validate(val_loader, model, criterion, epoch, args):
             batch_time.update(time.time() - end)
             end = time.time()
 
-            del loss1, loss2, loss
-            del out1, out2, out_gt, out_pred
             if batch % args.print_freq == 0:
                 progress.display(batch, logging.DEBUG)
+                writer.add_scalar('valid loss',
+                    loss.item(),
+                    epoch * len(val_loader) + batch)
 
         progress.display(batch, logging.INFO, reduce=True)
 
