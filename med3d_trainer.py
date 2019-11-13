@@ -7,13 +7,17 @@ import time
 import warnings
 import logging
 import copy
+import pdb
 
+warnings.filterwarnings("ignore")
+                        
 import numpy as np
 import pandas as pd
-import pdb
+from scipy import ndimage
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -27,7 +31,8 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 
 from utils.log import configure, log_arguments
-from lib import resnet as models
+from lib.models import resnet as models
+from lib.datasets.med3d import MED3D_dataset
 from lib.metrics import binary_dice
 from utils.meters import AverageMeter, MaxMeter, ProgressMeter, CumMeter
 
@@ -55,7 +60,7 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
 # parser.add_argument('--quantize', dest='quantize', action='store_true',
 #                     help='using quantization-aware traing')
 
-parser.add_argument('data', metavar='DIR',
+parser.add_argument('data_dir', metavar='DIR',
                     help='path to dataset')
 
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
@@ -99,27 +104,29 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 
 # logging config
-parser.add_argument('--log_level', default=20, type=int,
+parser.add_argument('--log-level', default=20, type=int,
                     help='logging level')
 
-trainer_name = sys.args[1]
+trainer_name = sys.argv[0].replace('.py','')
 time_string = time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())
 log_path = 'logs/'+trainer_name+'_{}.log'.format(time_string)
-logger = configure(log_path, logging.INFO)
+writer_path = 'runs/'+trainer_name+'/{}'.format(time_string)
+
+
 best_metric = 0
-metric_type = 'dice'
+metric_type = 'cross_entropy'
+
+logger = configure(log_path, logging.INFO)
 
 @log_arguments(logger)
 def update_args(args):
-	if not torch.cuda.is_available() or args.gpu==-1:
+    if not torch.cuda.is_available() or args.gpu==-1:
         args.device = torch.device('cpu')
-	elif args.gpu is None:
+    elif args.gpu is None:
         args.device = torch.device('cuda')
     else:
-    	loc = 'cuda:{}'.format(args.gpu)
-    	args.device = torch.device(loc)
-
-    logging.debug({}.format(args.device))
+        loc = 'cuda:{}'.format(args.gpu)
+        args.device = torch.device(loc)
     return args
 
 def main():
@@ -128,6 +135,7 @@ def main():
 
     args = parser.parse_args()
     args = update_args(args)
+    logging.debug('running on device: {}.'.format(args.device))
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -164,14 +172,14 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     global best_metric
 
-    # writer = SummaryWriter('runs/'+trainer_name+'/{}'.format(time_string))
-    model = models[args.ARCH]
-
-    # writer.add_graph(model, torch.randn(4,3,512,512))
-    # writer.flush()
-
+    writer = SummaryWriter(writer_path)
+    model = models.__dict__[args.arch](sample_input_D=256,
+                            sample_input_H=256,
+                            sample_input_W=256,
+                           num_seg_classes=3)
+#     pdb.set_trace()
     if args.resume:
-        model = resume(model, args)
+        model, parameters = resume(model, args)
 
     if args.distributed:
         if args.dist_url == "env://" and args.rank == -1:
@@ -183,14 +191,17 @@ def main_worker(gpu, ngpus_per_node, args):
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
             
-    model.to_device(args.device)
+    model.to(args.device)
+    logging.info('load model.')
 
-    if args.distributed:
+    if args.gpu == -1:
+        model = model
+    elif args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
         # DistributedDataParallel will use all available devices.
         if args.gpu is not None:
-        	torch.cuda.set_device(args.gpu)
+            torch.cuda.set_device(args.gpu)
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
@@ -203,10 +214,72 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.parallel.DistributedDataParallel(model)
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
-        model = torch.nn.DataParallel(model).to_device(args.device)
+        model = torch.nn.DataParallel(model).to(args.device)
 
     if args.gpu != -1:
         cudnn.benchmark = True
+
+#     writer.add_graph(model, torch.randn(1,1,256,512,512).to(args.device))
+#     writer.flush()
+                     
+    train_dataset = MED3D_dataset('trn', args.data_dir)
+    val_dataset = MED3D_dataset('val', args.data_dir)
+    logging.info('load dataset.')
+    
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+            num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+    val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True)
+    
+    criterion = nn.CrossEntropyLoss(ignore_index=-1).to(args.device)
+    params = [
+            { 'params': parameters['base_parameters'], 'lr': args.lr }, 
+            { 'params': parameters['new_parameters'], 'lr': args.lr*100 }
+            ]
+    optimizer = torch.optim.SGD(params, momentum=0.9, weight_decay=1e-3)   
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+    logging.info('config criterion, optimizer, scheduler.')
+    
+    if args.evaluate:
+        validate(val_loader, model, criterion, 0, args)
+        return
+    
+    
+    for epoch in range(args.epochs):
+        logging.info('lr = {}'.format(scheduler.get_lr()))
+        
+        train(train_loader, model, criterion, optimizer, epoch, args, writer)
+
+        loss, dice = validate(val_loader, model, criterion, epoch, args, writer)
+
+        is_best = dice < best_metric
+        best_metric = min(dice, best_metric)
+
+#         writer.add_scalar('val_dice', dice)
+#         writer.flush()
+        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                and args.rank % ngpus_per_node == 0):
+            if hasattr(model, 'module'):
+                model_ = copy.deepcopy(model.module)
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.module.state_dict(),
+                'best_metric': best_metric,
+                'metric_type': metric_type,
+                'optimizer' : optimizer.state_dict(),
+            }, 
+            is_best,
+            filename='{path}/checkpoint_{epoch}.pth.tar'.format(path=writer_path, epoch=epoch))
+        scheduler.step()
 
 def resume(model, args):
     global best_metric
@@ -219,7 +292,16 @@ def resume(model, args):
             else:
                 # Map model to be loaded to specified single gpu.
                 checkpoint = torch.load(args.resume, map_location=args.device)
-            model.load_state_dict(checkpoint['model'])    
+#             new_state_dict = OrderedDict()
+#             for k,v in ckpt['state_dict'].items():
+#                 _k = k.replace('module.','')
+#                 new_state_dict[_k] = v
+
+            # partially load state dict
+            model_dict = model.state_dict()
+            pretrained_state = {k:v for k,v in checkpoint['state_dict'].items() if k in model_dict}
+            model_dict.update(pretrained_state)
+            model.load_state_dict(model_dict)    
             # args.start_epoch = checkpoint['epoch']
             # best_dice = checkpoint['best_acc1']
             # if args.gpu is not None:
@@ -230,6 +312,117 @@ def resume(model, args):
             # print("=> loaded checkpoint '{}' (epoch {})"
             #       .format(args.resume, checkpoint['epoch']))
         else:
-            logging.info("=> no checkpoint found at '{}'".format(args.resume))
+            logging.warning("=> no checkpoint found at '{}'".format(args.resume))
 
-    return model
+        new_parameters = [] 
+        for pname, p in model.named_parameters():
+            if pname not in pretrained_state.keys():
+                new_parameters.append(p)
+
+        new_parameters_id = list(map(id, new_parameters))
+        base_parameters = list(filter(lambda p: id(p) not in new_parameters_id, model.parameters()))
+        parameters = {'base_parameters': base_parameters, 
+                    'new_parameters': new_parameters}
+
+        return model, parameters
+    return model, model.parameters()
+
+def train(train_loader, model, criterion, optimizer, epoch, args, writer=None):
+    # TODO: get writer from locals()
+    # writer = locals()['writer']
+    batch_time = CumMeter('Time(s)', ':.2f')
+    data_time = CumMeter('Data(s)', ':.2f')
+    losses = AverageMeter('bce', ':.3e')
+    dices = AverageMeter('dice', ':.3f')
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, dices],
+        prefix="Epoch: [{}][trn]".format(epoch),
+        )
+
+    model.train()
+    end = time.time()
+    for batch, (volumes, label_masks) in enumerate(train_loader): 
+
+        data_time.update(time.time() - end)
+
+        volumes, label_masks = volumes.to(args.device), label_masks.to(args.device)
+        out_masks = model(volumes)
+        
+        # resize label
+        [n, _, d, h, w] = out_masks.shape
+        
+        new_label_masks = F.interpolate(label_masks, size=(d,h,w))#.to(torch.int64)
+        loss = criterion(out_masks, new_label_masks.squeeze(1).to(torch.int64))
+
+        logging.debug('{}'.format(loss))
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # TODO: add dice
+        pred_masks = F.softmax(out_masks, dim=1).argmax(dim=1)
+        dice = binary_dice(pred_masks, new_label_masks)
+
+        losses.update(loss.item(), 2)
+        dices.update(dice.item(), 2)
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if batch % args.print_freq == 0:
+            progress.display(batch, logging.DEBUG)
+            writer.add_scalar('Loss/train',
+                loss.item(),
+                epoch * len(train_loader) + batch)
+#             output_grid = select_rand(out_pred[:,1,...].detach(), out_gt[:,1,...].detach())
+#             writer.add_image('out_pred', 
+#                 output_grid, 
+#                 epoch * len(train_loader) + batch,
+#                 dataformats='CHW')
+
+    progress.display(batch, logging.INFO, reduce=True)
+
+def validate(train_loader, model, criterion, epoch, args, writer=None):
+    batch_time = CumMeter('Time(s)', ':.2f')
+    data_time = CumMeter('Data(s)', ':.2f')
+    losses = AverageMeter('bce', ':.3e')
+    dices = AverageMeter('dice', ':.3f')
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, dices],
+        prefix="Epoch: [{}][val]".format(epoch),
+        )
+
+    model.eval()
+    end = time.time()
+    with torch.no_grad():
+        for batch, (volumes, label_masks) in enumerate(train_loader): 
+
+            data_time.update(time.time() - end)
+
+            volumes, label_masks = volumes.to(args.device), label_masks.to(args.device)
+            out_masks = model(volumes)
+
+            new_label_masks = nn.functional.interpolate(label_masks, size=(d,h,w))#.to(torch.int64)
+            loss = criterion(out_masks, new_label_masks.squeeze(1).to(torch.int64))
+
+            pred_masks = F.softmax(out_masks, dim=1).argmax(dim=1)
+            dice = binary_dice(pred_masks, new_label_masks)
+
+            losses.update(loss.item(), 2)
+            dices.update(dice.item(), 2)
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if batch % args.print_freq == 0:
+                progress.display(batch, logging.DEBUG)
+                writer.add_scalar('Loss/eval',
+                    loss.item(),
+                    epoch * len(train_loader) + batch)
+
+        progress.display(batch, logging.INFO, reduce=True)
+
+if __name__ == '__main__':
+    import pdb
+    main()
+    # pdb.set_trace()

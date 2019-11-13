@@ -296,15 +296,6 @@ def main_worker(gpu, ngpus_per_node, args):
             }, 
             is_best,
             filename='checkpoints/checkpoint_{epoch}.pth.tar'.format(epoch=epoch))
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.module.state_dict(),
-                'best_metric': best_dice,
-                'optimizer' : optimizer.state_dict(),
-            }, 
-            is_best,
-            filename='checkpoints/qat_checkpoint_{epoch}.pth.tar'.format(epoch=epoch))
 
 def resume(model, args):
     global best_dice
