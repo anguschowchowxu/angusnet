@@ -193,7 +193,7 @@ class MED3D_dataset(Dataset):
         label = self.__resize_data__(label)
 
         # normalization datas
-        data = self.__itensity_normalize_one_volume__(data)
+        # data = self.__itensity_normalize_one_volume__(data)
 
         return data, label
 

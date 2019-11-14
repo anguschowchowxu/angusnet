@@ -33,8 +33,10 @@ import torchvision.models as models
 from utils.log import configure, log_arguments
 from lib.models import resnet as models
 from lib.datasets.med3d import MED3D_dataset
-from lib.metrics import binary_dice
+from lib.metrics import binary_dice, multi_dice, to_one_hot
+from lib.loss import MulticlassDiceLoss
 from utils.meters import AverageMeter, MaxMeter, ProgressMeter, CumMeter
+from utils.tensorboard_utils import select_rand
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -249,7 +251,7 @@ def main_worker(gpu, ngpus_per_node, args):
     logging.info('config criterion, optimizer, scheduler.')
     
     if args.evaluate:
-        validate(val_loader, model, criterion, 0, args)
+        validate(val_loader, model, criterion, 0, args, writer)
         return
     
     
@@ -260,8 +262,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
         loss, dice = validate(val_loader, model, criterion, epoch, args, writer)
 
-        is_best = dice < best_metric
-        best_metric = min(dice, best_metric)
+        is_best = loss < best_metric
+        best_metric = min(loss, best_metric)
 
 #         writer.add_scalar('val_dice', dice)
 #         writer.flush()
@@ -355,14 +357,15 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None):
         new_label_masks = F.interpolate(label_masks, size=(d,h,w))#.to(torch.int64)
         loss = criterion(out_masks, new_label_masks.squeeze(1).to(torch.int64))
 
-        logging.debug('{}'.format(loss))
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # TODO: add dice
-        pred_masks = F.softmax(out_masks, dim=1).argmax(dim=1)
-        dice = binary_dice(pred_masks, new_label_masks)
+        # TODO: check multi dice
+        pred_masks = F.softmax(out_masks, dim=1).permute(0,2,3,4,1)
+        pred_masks = pred_masks.reshape(-1, pred_masks.shape[-1])
+        new_label_masks_onehot = to_one_hot(new_label_masks, 3)
+        dice = multi_dice(pred_masks, new_label_masks_onehot)
 
         losses.update(loss.item(), 2)
         dices.update(dice.item(), 2)
@@ -371,24 +374,46 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer=None):
 
         if batch % args.print_freq == 0:
             progress.display(batch, logging.DEBUG)
+
             writer.add_scalar('Loss/train',
                 loss.item(),
                 epoch * len(train_loader) + batch)
-#             output_grid = select_rand(out_pred[:,1,...].detach(), out_gt[:,1,...].detach())
-#             writer.add_image('out_pred', 
-#                 output_grid, 
-#                 epoch * len(train_loader) + batch,
-#                 dataformats='CHW')
+
+            writer.add_scalar('Dice/train',
+                dice.item(),
+                epoch * len(train_loader) + batch)
+
+            # pdb.set_trace()
+
+        if batch % 10*args.print_freq == 0:
+            output_grid = select_rand(volumes[:,0,...].detach(), label_masks[:,0,...].detach())
+            writer.add_image('Dataset/train', 
+                output_grid, 
+                epoch * len(train_loader) + batch,
+                dataformats='CHW')
+            pred_masks = F.softmax(out_masks, dim=1).argmax(dim=1)
+            output_grid = select_rand(pred_masks.detach(), new_label_masks[:,0,...].detach())
+            writer.add_image('out_pred/train', 
+                output_grid, 
+                epoch * len(train_loader) + batch,
+                dataformats='CHW')
 
     progress.display(batch, logging.INFO, reduce=True)
+    writer.add_scalar('Epoch/train_loss',
+        losses.avg,
+        epoch)
 
-def validate(train_loader, model, criterion, epoch, args, writer=None):
+    writer.add_scalar('Epoch/train_dice',
+        dices.avg,
+        epoch)
+
+def validate(val_loader, model, criterion, epoch, args, writer=None):
     batch_time = CumMeter('Time(s)', ':.2f')
     data_time = CumMeter('Data(s)', ':.2f')
     losses = AverageMeter('bce', ':.3e')
     dices = AverageMeter('dice', ':.3f')
     progress = ProgressMeter(
-        len(train_loader),
+        len(val_loader),
         [batch_time, data_time, losses, dices],
         prefix="Epoch: [{}][val]".format(epoch),
         )
@@ -396,18 +421,22 @@ def validate(train_loader, model, criterion, epoch, args, writer=None):
     model.eval()
     end = time.time()
     with torch.no_grad():
-        for batch, (volumes, label_masks) in enumerate(train_loader): 
+        for batch, (volumes, label_masks) in enumerate(val_loader): 
 
             data_time.update(time.time() - end)
 
             volumes, label_masks = volumes.to(args.device), label_masks.to(args.device)
             out_masks = model(volumes)
 
+            [n, _, d, h, w] = out_masks.shape
+
             new_label_masks = nn.functional.interpolate(label_masks, size=(d,h,w))#.to(torch.int64)
             loss = criterion(out_masks, new_label_masks.squeeze(1).to(torch.int64))
 
-            pred_masks = F.softmax(out_masks, dim=1).argmax(dim=1)
-            dice = binary_dice(pred_masks, new_label_masks)
+            pred_masks = F.softmax(out_masks, dim=1).permute(0,2,3,4,1)
+            pred_masks = pred_masks.reshape(-1, pred_masks.shape[-1])
+            new_label_masks_onehot = to_one_hot(new_label_masks, 3)
+            dice = multi_dice(pred_masks, new_label_masks_onehot)
 
             losses.update(loss.item(), 2)
             dices.update(dice.item(), 2)
@@ -416,12 +445,38 @@ def validate(train_loader, model, criterion, epoch, args, writer=None):
 
             if batch % args.print_freq == 0:
                 progress.display(batch, logging.DEBUG)
-                writer.add_scalar('Loss/eval',
+
+                writer.add_scalar('Loss/val',
                     loss.item(),
-                    epoch * len(train_loader) + batch)
+                    epoch * len(val_loader) + batch)
+
+                writer.add_scalar('Dice/val',
+                    dice.item(),
+                    epoch * len(val_loader) + batch)
+
+            if batch % 10*args.print_freq == 0:
+                pred_masks = F.softmax(out_masks, dim=1).argmax(dim=1)
+                output_grid = select_rand(pred_masks.detach(), new_label_masks[:,0,...].detach())
+                writer.add_image('out_pred/val', 
+                    output_grid, 
+                    epoch * len(val_loader) + batch,
+                    dataformats='CHW')
 
         progress.display(batch, logging.INFO, reduce=True)
+        writer.add_scalar('Epoch/val_loss',
+            losses.avg,
+            epoch)
 
+        writer.add_scalar('Epoch/val_dice',
+            dices.avg,
+            epoch)
+    return losses.avg, dices.avg
+
+def save_checkpoint(state, is_best, filename='checkpoints/checkpoint.pth.tar'):
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, 'checkpoints/model_best.pth.tar')
+        
 if __name__ == '__main__':
     import pdb
     main()

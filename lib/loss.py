@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+
 class weighted_bce_dice_loss_2d(nn.Module):
     def __init__(self, size_average=True, is_weight=True):
         super().__init__()
@@ -37,3 +38,60 @@ class weighted_bce_dice_loss_2d(nn.Module):
         loss = dice_loss#  + bce_loss
 
         return loss
+
+
+# BUG: negative value
+class DiceLoss(nn.Module):
+    def __init__(self):
+        super(DiceLoss, self).__init__()
+ 
+    def forward(self, input, target):
+        N = target.size(0)
+        smooth = 1
+ 
+        input_flat = input.view(N, -1)
+        target_flat = target.view(N, -1)
+ 
+        intersection = input_flat * target_flat
+
+        loss = 2 * (intersection.sum(1) + smooth) / (input_flat.sum(1) + target_flat.sum(1) + smooth)
+        loss = 1 - loss.sum() / N
+ 
+        return loss
+
+
+class MulticlassDiceLoss(nn.Module):
+    """
+    requires one hot encoded target. Applies DiceLoss on each class iteratively.
+    requires input.shape[0:1] and target.shape[0:1] to be (N, C) where N is
+      batch size and C is number of classes
+    """
+    def __init__(self):
+        super(MulticlassDiceLoss, self).__init__()
+ 
+    def forward(self, input, target, weights=None):
+ 
+        C = target.shape[1]
+ 
+        # if weights is None:
+        #   weights = torch.ones(C) #uniform weights for all classes
+ 
+        dice = DiceLoss()
+        totalLoss = 0
+ 
+        for i in range(C):
+            diceLoss = dice(input[:,i], target[:,i])
+            if weights is not None:
+                diceLoss *= weights[i]
+            totalLoss += diceLoss
+ 
+        return totalLoss
+
+    def to_one_hot(self, tensor, nb_digits):
+        b, c, d, h, w = tensor.shape
+        tensor = tensor.to(torch.int64).reshape(-1, 1)
+
+        tensor_onehot = torch.FloatTensor(torch.numel(tensor), nb_digits).to(tensor.get_device())
+        tensor_onehot.zero_()
+        tensor_onehot.scatter_(1, tensor, 1)
+        return tensor_onehot

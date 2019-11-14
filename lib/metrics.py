@@ -33,3 +33,33 @@ def binary_dice(output, target, threshold=0.5):
     dice_coeff = torch.mean(dice_loss)
     
     return dice_coeff
+
+def multi_dice(input, target, weights=None):
+    """
+    requires one hot encoded target. Applies DiceLoss on each class iteratively.
+    requires input.shape[0:1] and target.shape[0:1] to be (N, C) where N is
+      batch size and C is number of classes
+"""
+    C = target.shape[1]
+
+    # if weights is None:
+    #   weights = torch.ones(C) #uniform weights for all classes
+
+    total_coef = 0
+
+    for i in range(C):
+        dice_coef = binary_dice(input[:,i], target[:,i])
+        if weights is not None:
+            dice_coef *= weights[i]
+        total_coef += dice_coef
+
+    return total_coef/C
+
+def to_one_hot(tensor, nb_digits):
+    b, c, d, h, w = tensor.shape
+    tensor = tensor.to(torch.int64).reshape(-1, 1)
+
+    tensor_onehot = torch.FloatTensor(torch.numel(tensor), nb_digits).to(tensor.get_device())
+    tensor_onehot.zero_()
+    tensor_onehot.scatter_(1, tensor, 1)
+    return tensor_onehot
